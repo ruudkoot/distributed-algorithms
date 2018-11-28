@@ -10,6 +10,9 @@ import Control.Monad.Trans
 import Control.Monad.Trans.Free
 import Control.Monad.Trans.State
 
+import Control.Concurrent
+import Control.Concurrent.Chan
+
 -- | Process monad
 
 type Clk = Int
@@ -40,12 +43,16 @@ recv = liftF (Recv id)
 time :: (Monad m) => ProcessT msg m Clk
 time = liftF (Time id)
 
--- * Schedulers
+-- | Schedulers
 
-roundRobin :: (Monad m) => [(String, ProcessT msg m a)] -> m ()
+type Label = String
+
+-- * Round-Robin (sequential)
+
+roundRobin :: (Monad m) => [(Label, ProcessT msg m a)] -> m ()
 roundRobin = roundRobin' []
 
-roundRobin' :: (Monad m) => [msg] -> [(String, ProcessT msg m a)] -> m ()
+roundRobin' :: (Monad m) => [msg] -> [(Label, ProcessT msg m a)] -> m ()
 roundRobin' mq [] = return ()
 roundRobin' mq ((lbl, p) : pq) = runFreeT p >>= \case
     Free (Tau action next) -> do
@@ -64,6 +71,30 @@ roundRobin' mq ((lbl, p) : pq) = runFreeT p >>= \case
     Pure x -> do
         roundRobin' mq pq
 
+-- * Threaded (parallel)
+
+threaded :: [(Label, ProcessT msg IO a)] -> IO ()
+threaded pq = do
+    mq <- newChan
+    forM_ pq (forkIO . uncurry (threaded' mq))
+
+threaded' :: Chan msg -> Label -> ProcessT msg IO a -> IO ()
+threaded' mq lbl p = runFreeT p >>= \case
+    Free (Tau action next) -> do
+        x <- action
+        threaded' mq lbl (next x)
+    Free (Send msg next) -> do
+        writeChan mq msg
+        threaded' mq lbl next
+    Free (Recv next) -> do
+        msg <- readChan mq
+        threaded' mq lbl (next msg)
+    Free (Time next) -> do
+        threaded' mq lbl (next 0)
+    Pure x -> do
+        return ()
+
+
 -- | Example processes
 
 type Msg = String
@@ -76,3 +107,6 @@ process1 = forever $ do
 process2 = forever $ do
     msg <- recv
     send (msg ++ "fish")
+
+processes :: [(Label, ProcessT Msg IO ())]
+processes = [("P1", process1), ("P2", process2)]
